@@ -1,3 +1,4 @@
+import os
 from __future__ import annotations
 import math
 import sys
@@ -5,13 +6,15 @@ import torch
 import references.detection.utils as utils
 from references.detection.engine import train_one_epoch, evaluate
 from dataset import SatDataset, PennFudanDataset, get_transform, CSVDataset, KeypointDataset
-from models import get_model_instance_segmentation, SimpleNetwork
+from models.simple_models import get_model_instance_segmentation, SimpleNetwork, AutoEncoderNetwork
 import wandb
 import PIL
 import numpy as np
-from utils import plot_image_and_target, plot_image_target_pred, count_parameters
+from utils import plot_image_and_target, plot_image_target_pred, count_parameters, channel_to_color, save_ckp, load_ckp
 from collections import deque
 from datetime import datetime
+from distinctipy import distinctipy
+import matplotlib.pyplot as plt
 
 
 def main():
@@ -23,13 +26,14 @@ def main():
     })
     config = wandb.config
     wandb_name = wandb.run.name + "_" + wandb.run.id
-
+    checkpoint_dir = os.path.join('trained_models', wandb_name)
     # train on the GPU or on the CPU, if a GPU is not available
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
     # use our dataset and defined transformations
-    dataset = KeypointDataset('Datasets/KP_48k_30_50_70', 'JoinedData.csv')
-    dataset_test = KeypointDataset('Datasets/KP_48k_30_50_70', 'JoinedData.csv')
+    dataset = KeypointDataset('Datasets/KP_48k_30_50_70', 'JoinedData.csv', is_gaussian=True)
+
+    dataset_test = KeypointDataset('Datasets/KP_48k_30_50_70', 'JoinedData.csv', is_gaussian=True)
 
     # split the dataset in train and test set
     indices = torch.randperm(len(dataset)).tolist()
@@ -47,7 +51,7 @@ def main():
         collate_fn=utils.collate_fn)
 
     # get the model using our helper function
-    model = SimpleNetwork(input_size=400)
+    model = AutoEncoderNetwork(input_size=400)
     count_parameters(model)
     # move model to the right device
     model.to(device)
@@ -73,6 +77,9 @@ def main():
     curr_lr = 0
     queue = deque()
     epoch_queue = deque()
+    plot = False
+    number_of_keypoints = 5
+    colors = distinctipy.get_colors(number_of_keypoints)
     for epoch in range(num_epochs):
         epoch_start_time = datetime.now()
         # train for one epoch, printing every 10 iterations
@@ -96,7 +103,7 @@ def main():
             if len(queue) > 0:
                 d_time = np.mean(queue)
                 str = 'E: {} i: {}/{} - Est rem ept: {:1.2f} -- ' \
-                      'curr loss: {:1.3f}, mean loss: {:1.3f}'.format(epoch, iter_num, n_iters,
+                      'curr loss: {:1.5f}, mean loss: {:1.5f}'.format(epoch, iter_num, n_iters,
                                                                       d_time * (len(data_loader) - iter_num),
                                                                       float(losses), np.mean(mean_loss))
                 print(str, end='\r')
@@ -104,10 +111,6 @@ def main():
             optimizer.zero_grad()
             losses.backward()
             optimizer.step()
-            if iter_num == 0:
-                img = images
-                lbl = labels
-                output = pred
 
             if lr_scheduler is not None:
                 lr_scheduler.step()
@@ -117,12 +120,11 @@ def main():
                 queue.pop()
 
         print(" " * strlen, end='\r')
-        print("Epoch {} loss: {:1.3f}".format(epoch, np.mean(mean_loss)))
+        print("Epoch {} loss: {:1.5f}".format(epoch, np.mean(mean_loss)))
         # validation
         test_len = len(data_loader_test)
-        v_img = 0
-        v_lbl = 0
-        v_out = 0
+        v_img, v_lbl, v_out = 0, 0, 0
+
         for iter_num, data in enumerate(data_loader_test):
             images, angles, labels = data
             images = torch.stack(images).to(device)
@@ -132,30 +134,47 @@ def main():
             mean_val_loss.append(float(val_losses))
             print('val step: {}/{}'.format(iter_num, test_len), end='\r')
             if iter_num == 0:
-                v_img = images
-                v_lbl = labels
-                v_out = pred
+                v_img, v_lbl, v_out = images, labels, pred
+
         print('Validation Mean loss {:1.3f}'.format(np.mean(mean_val_loss)))
 
-        # update the learning rate
-        # lr_scheduler.step()
-        # evaluate on the test dataset
-        # val_log, img, out = evaluate(model, data_loader_test, device=device)
+        # # Writing to wandb log
+        log_dict = {"train/loss": np.mean(mean_loss),
+                    "val/loss": np.mean(mean_val_loss),
+                    "optim/lr": curr_lr}
 
-        # img_t = plot_image_target_pred(img[0].cpu(), lbl[0].cpu(), output[0].detach().cpu().numpy())
-        # img_t = wandb.Image(img_t)
-        # img_v = plot_image_target_pred(v_img[0].cpu(), v_lbl[0].cpu(), v_out[0].detach().cpu().numpy())
-        # img_v = wandb.Image(img_v)
+        pred_in_numpy = v_out[0].detach().cpu().numpy()
+        images, joined = channel_to_color(pred_in_numpy, colors)
+        img_in_numpy = v_img[0].permute(1, 2, 0).detach().cpu().numpy()
+        log_dict["pred"] = wandb.Image(joined + img_in_numpy)
+        for x, i in enumerate(images):
+            log_dict["pred_kp_{}".format(x)] = wandb.Image(i)
+        # normalize
+        norm_pred = (pred_in_numpy - np.min(pred_in_numpy)) / (np.max(pred_in_numpy) - np.min(pred_in_numpy))
+        n_images, n_joined = channel_to_color(norm_pred, colors)
+        log_dict["n_pred"] = wandb.Image(joined + img_in_numpy)
+        for x, i in enumerate(n_images):
+            log_dict["n_pred_kp_{}".format(x)] = wandb.Image(i)
 
-        wandb.log({  # "img/img_tar_pred": wandb.Image(img_t),
-            # "img/img_tar_pred_val": wandb.Image(img_v),
-            "train/loss": np.mean(mean_loss),
-            "val/loss": np.mean(mean_val_loss),
-            "optim/lr": curr_lr})
+        if epoch == 0:
+            lbl_in_numpy = v_lbl[0].detach().cpu().numpy()
+            images, joined = channel_to_color(lbl_in_numpy, colors)
+            log_dict["lbl"] = wandb.Image(joined)
+            for x, i in enumerate(images):
+                log_dict["lbl_kp_{}".format(x)] = wandb.Image(i)
+
+        wandb.log(log_dict)
         delta_time = datetime.now() - epoch_start_time
         epoch_queue.appendleft(delta_time.total_seconds())
-        d_time = np.mean(queue)
-        print("epoch runtime: {1.3f}. --- est time remaining {1.3f}".format(d_time, d_time*(num_epochs-epoch)))
+        d_time = np.mean(epoch_queue)
+        print("epoch runtime: {:1.3f}. --- est time remaining {:1.3f}".format(d_time, d_time * (num_epochs - epoch)))
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': np.mean(mean_loss)
+        }
+        save_ckp(checkpoint, model, checkpoint_dir)
     print("That's it!")
 
 

@@ -4,7 +4,8 @@ import numpy as np
 import torch
 from math import cos, sin, sqrt, acos, radians
 from PIL import Image
-
+import os
+from distinctipy import distinctipy
 
 def count_parameters(model):
     table = PrettyTable(["Modules", "Parameters"])
@@ -146,3 +147,35 @@ def rot_vecs(rpy, inrad=True):
 
     return x, y, z
 
+
+def channel_to_color(grey_imgs, colors):
+    images = []
+    joined = np.zeros([grey_imgs.shape[1], grey_imgs.shape[2], 3])
+
+    for x, g in enumerate(grey_imgs):
+        reshaped = g.reshape(g.shape[0], g.shape[1], 1)
+        conc = np.concatenate([reshaped, reshaped, reshaped], axis=2)
+        colored = conc * colors[x]
+        images.append(colored)
+        joined += colored
+    joined[joined > 1] = 1
+    return images, joined
+
+
+def save_ckp(state, model, is_best, checkpoint_dir, epoch):
+    f_path = os.path.join(checkpoint_dir, 'checkpoint.pt')
+    torch.save(state, f_path)
+    if is_best:
+        best_filepath = os.path.join(checkpoint_dir, 'best_model_{}.pt'.format(epoch))
+        torch.save(state, best_filepath)
+
+
+def load_ckp(checkpoint_filepath, model, optimizer=None, scheduler=None):
+    cwd = os.path.join(os.getcwd(), checkpoint_filepath)
+    path = os.path.join(cwd, 'checkpoint.pt')
+    checkpoint = torch.load(path)
+    model.load_state_dict(checkpoint['state_dict'], strict=False)
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+    return model, optimizer, scheduler, checkpoint

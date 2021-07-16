@@ -131,14 +131,20 @@ class CSVDataset(object):
 class KeypointDataset(object):
     """CSV dataset."""
 
-    def __init__(self, root, train_file, use_path=True, transform=None):
+    def __init__(self, root, train_file, is_gaussian, use_path=True, transform=None):
         """
         Args:
             train_file (string): CSV file with training annotations
             annotations (string): CSV file with class list
             test_file (string, optional): CSV file with testing annotations
         """
-        self.target_type = "Gaussian"
+        self.gaussian_representation = is_gaussian
+        self.keypoints_weight = None
+        self.use_different_keypoints_weight = False
+        self.sigma = 6
+        self.heatmap_size = (400, 400)
+        self.num_keypoints = 5
+        self.target_type = "gaussian"
         self.train_file = os.path.join(root, train_file)
         self.transform = transform
         self.root = root
@@ -187,7 +193,12 @@ class KeypointDataset(object):
         sun_angles = torch.as_tensor(list(self.image_data[name].values()))
         kp_target = torch.as_tensor(list(self.image_target[name].values()))
         img, kp_target = self.center_crop(img, name, kp_target)
-        img, kp_target = self.as_percent(img, kp_target)
+        if self.gaussian_representation:
+            kp_target, weights = self.generate_target(kp_target, np.ones_like(kp_target)) # fix so we use visible when data exists
+            kp_target = torch.as_tensor(kp_target)
+        else:
+            img, kp_target = self.as_percent(img, kp_target)
+
         if self.transform:
             img, target = self.transform(img, kp_target)
 
@@ -200,8 +211,8 @@ class KeypointDataset(object):
         return img.astype(np.float32) / 255.0
 
     def as_percent(self, img, kp_target):
-        kp_target[:, :2] = self.input_size / kp_target[:, :2]
-        return img, kp_target[:, :2]
+        kp_target[:, :3] = kp_target[:, :3] / self.input_size
+        return img, kp_target[:, :3]
 
     def _read_data(self, csv_reader):
         result = {}
@@ -235,36 +246,37 @@ class KeypointDataset(object):
                     None)
         return sun_angles, result
 
-    def generate_target(self, joints, joints_vis):
+    def generate_target(self, keypoints, keypoints_vis):
         """
-        :param joints:  [num_joints, 3]
-        :param joints_vis: [num_joints, 3]
+        :param keypoints:  [num_keypoints, 3]
+        :param keypoints_vis: [num_keypoints, 3] 3???? shouldn't this be 1?
         :return: target, target_weight(1: visible, 0: invisible)
         """
-        target_weight = np.ones((self.num_joints, 1), dtype=np.float32)
-        target_weight[:, 0] = joints_vis[:, 0]
+
+        target_weight = np.ones((self.num_keypoints, 1), dtype=np.float32)
+        target_weight[:, 0] = keypoints_vis[:, 0]
 
         assert self.target_type == 'gaussian', 'Only supports gaussian map for now!'
 
+        target = np.zeros((self.num_keypoints,
+                           self.heatmap_size[1],
+                           self.heatmap_size[0]),
+                          dtype=np.float32)
         if self.target_type == 'gaussian':
-            target = np.zeros((self.num_joints,
-                               self.heatmap_size[1],
-                               self.heatmap_size[0]),
-                              dtype=np.float32)
 
             tmp_size = self.sigma * 3
 
-            for joint_id in range(self.num_joints):
-                feat_stride = self.image_size / self.heatmap_size
-                mu_x = int(joints[joint_id][0] / feat_stride[0] + 0.5)
-                mu_y = int(joints[joint_id][1] / feat_stride[1] + 0.5)
-                # Check that any part of the gaussian is in-bounds
-                ul = [int(mu_x - tmp_size), int(mu_y - tmp_size)]
-                br = [int(mu_x + tmp_size + 1), int(mu_y + tmp_size + 1)]
+            for kp_id in range(self.num_keypoints):
+                feat_stride = self.input_size / self.heatmap_size[0]
+                mu_x = int(keypoints[kp_id][0] / feat_stride + 0.5)
+                mu_y = int(keypoints[kp_id][1] / feat_stride + 0.5)
+                # Check that any part of the gaussian is out of bounds
+                ul = [int(mu_x - tmp_size), int(mu_y - tmp_size)]  # upper limit?
+                br = [int(mu_x + tmp_size + 1), int(mu_y + tmp_size + 1)]  # bottom row?
                 if ul[0] >= self.heatmap_size[0] or ul[1] >= self.heatmap_size[1] \
                         or br[0] < 0 or br[1] < 0:
                     # If not, just return the image as is
-                    target_weight[joint_id] = 0
+                    target_weight[kp_id] = 0
                     continue
 
                 # # Generate gaussian
@@ -273,7 +285,7 @@ class KeypointDataset(object):
                 y = x[:, np.newaxis]
                 x0 = y0 = size // 2
                 # The gaussian is not normalized, we want the center value to equal 1
-                g = np.exp(- ((x - x0) ** 2 + (y - y0) ** 2) / (2 * self.sigma ** 2))
+                gaussian = np.exp(- ((x - x0) ** 2 + (y - y0) ** 2) / (2 * self.sigma ** 2))
 
                 # Usable gaussian range
                 g_x = max(0, -ul[0]), min(br[0], self.heatmap_size[0]) - ul[0]
@@ -282,16 +294,16 @@ class KeypointDataset(object):
                 img_x = max(0, ul[0]), min(br[0], self.heatmap_size[0])
                 img_y = max(0, ul[1]), min(br[1], self.heatmap_size[1])
 
-                v = target_weight[joint_id]
+                v = target_weight[kp_id]
+                # why 0.5 ? this is never set do they state this in paper? some kp less weight than others?
                 if v > 0.5:
-                    target[joint_id][img_y[0]:img_y[1], img_x[0]:img_x[1]] = \
-                        g[g_y[0]:g_y[1], g_x[0]:g_x[1]]
+                    target[kp_id][img_y[0]:img_y[1], img_x[0]:img_x[1]] = \
+                        gaussian[g_y[0]:g_y[1], g_x[0]:g_x[1]]
 
-        if self.use_different_joints_weight:
-            target_weight = np.multiply(target_weight, self.joints_weight)
+        if self.use_different_keypoints_weight:
+            target_weight = np.multiply(target_weight, self.keypoints_weight)
 
         return target, target_weight
-
 
     def image_aspect_ratio(self, image_index):
         image = Image.open(self.image_names[image_index])
@@ -304,7 +316,8 @@ class KeypointDataset(object):
 
     def sat_size_and_target_reshape(self, img, dist, kp_target):
         img_shape = img.shape
-        size = int(self.sat_size(dist, img_shape, self.fov, self.souyz_width) * 1.1)
+        resize_factor = 1.2
+        size = int(self.sat_size(dist, img_shape, self.fov, self.souyz_width) * resize_factor)
         x_red = int((img_shape[2] - size) / 2)
         y_red = int((img_shape[1] - size) / 2)
         for x in kp_target:
